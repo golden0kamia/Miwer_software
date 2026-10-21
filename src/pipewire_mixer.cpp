@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
+#include <cmath>
 #include <cstring>
+#include <deque>
 #include <iostream>
 #include <stdexcept>
 
@@ -22,6 +25,23 @@ constexpr const char* kClassSource = "Audio/Source";
 
 constexpr const char* kKeyDefaultSink = "default.audio.sink";
 constexpr const char* kKeyDefaultSource = "default.audio.source";
+
+using Clock = std::chrono::steady_clock;
+
+// Écart minimal (échelle perceptuelle) entre le volume rapporté par un node et celui que
+// Miwer lui a appliqué pour parler de changement externe.
+constexpr float kExternalTolerance = 0.005f;
+// Durée pendant laquelle un réglage appliqué par Miwer peut encore revenir en écho.
+constexpr auto kEchoWindow = std::chrono::milliseconds(1000);
+constexpr size_t kMaxApplied = 32;
+// Après le premier réglage d'un node, un écart est corrigé au lieu d'être adopté (par exemple
+// WirePlumber qui restaure le volume mémorisé d'une application juste après son apparition).
+constexpr auto kGracePeriod = std::chrono::milliseconds(1000);
+
+std::string percent(float v)
+{
+    return std::to_string(static_cast<int>(std::lround(v * 100.0f))) + " %";
+}
 
 std::string toLower(const char* s)
 {
@@ -75,6 +95,38 @@ struct PipeWireMixer::Node {
     int channel = -1;       // canal du mixeur, -1 = non assigné
     bool infoReceived = false;
     bool pendingApply = false;
+
+    // Réglages appliqués par Miwer (ou adoptés), pour reconnaître les échos de nos propres
+    // pw_node_set_param. Le dernier élément est l'état que Miwer pense être celui du node.
+    struct Applied {
+        float volume;  // perceptuel, non borné (un node peut dépasser 100 %)
+        bool muted;
+        Clock::time_point time;
+    };
+    std::deque<Applied> applied;
+    Clock::time_point graceUntil{};
+
+    // Dernier état rapporté par le node
+    bool hasReport = false;
+    float reportVolume = 0.0f;
+    bool reportHasMute = false;
+    bool reportMuted = false;
+
+    void remember(float volume, bool muted)
+    {
+        const auto now = Clock::now();
+        applied.push_back({volume, muted, now});
+        while (applied.size() > 1 && (applied.size() > kMaxApplied || now - applied.front().time > kEchoWindow))
+            applied.pop_front();
+    }
+
+    bool isEcho(float volume, bool hasMute, bool muted) const
+    {
+        for (const auto& a : applied)
+            if (std::fabs(a.volume - volume) <= kExternalTolerance && (!hasMute || a.muted == muted))
+                return true;
+        return false;
+    }
 };
 
 struct PipeWireMixer::Metadata {
@@ -150,9 +202,7 @@ void PipeWireMixer::setChannelVolume(int channel, float volume)
         return;
     m_volumes[channel] = std::clamp(volume, 0.0f, 1.0f);
     m_volumeKnown[channel] = true;
-    for (auto& [id, node] : m_nodes)
-        if (node->channel == channel)
-            applyToNode(*node);
+    applyToChannel(channel, nullptr);
 }
 
 void PipeWireMixer::setChannelMute(int channel, bool muted)
@@ -161,9 +211,7 @@ void PipeWireMixer::setChannelMute(int channel, bool muted)
         return;
     m_mutes[channel] = muted;
     log("canal " + std::to_string(channel + 1) + (muted ? " muet" : " actif"));
-    for (auto& [id, node] : m_nodes)
-        if (node->channel == channel)
-            applyToNode(*node);
+    applyToChannel(channel, nullptr);
 }
 
 // ---------------------------------------------------------------- Logique
@@ -208,9 +256,93 @@ void PipeWireMixer::remapAll()
             node->channel = ch;
             log("node " + std::to_string(id) + " (" + node->nodeName + ") -> canal " +
                 (ch < 0 ? std::string("aucun") : std::to_string(ch + 1)));
-            applyToNode(*node);
+            onChannelAssigned(*node);
         }
     }
+    updateActiveCounts();
+}
+
+void PipeWireMixer::applyToChannel(int channel, const Node* except)
+{
+    for (auto& [id, node] : m_nodes)
+        if (node->channel == channel && node.get() != except)
+            applyToNode(*node);
+}
+
+void PipeWireMixer::updateActiveCounts()
+{
+    std::array<int, kNumChannels> counts{};
+    for (const auto& [id, node] : m_nodes)
+        if (node->infoReceived && node->channel >= 0)
+            ++counts[node->channel];
+
+    for (int ch = 0; ch < kNumChannels; ++ch) {
+        if (counts[ch] == m_activeCounts[ch])
+            continue;
+        m_activeCounts[ch] = counts[ch];
+        if (m_onActiveCountChanged)
+            m_onActiveCountChanged(ch, counts[ch]);
+    }
+}
+
+// Volume / mute rapportés par un node (param Props). Distingue les échos de nos propres
+// réglages des changements faits ailleurs.
+void PipeWireMixer::handleReportedProps(Node& node, float volume, bool hasMute, bool muted)
+{
+    const int ch = node.channel;
+    if (!m_cfg.followExternal || ch < 0)
+        return;
+
+    const bool mute = hasMute ? muted : m_mutes[ch];
+    const std::string nodeDesc = "node " + std::to_string(node.id) + " (" + node.nodeName + ")";
+
+    if (!m_volumeKnown[ch]) {
+        // Volume du canal encore inconnu : on adopte l'état réel du node, sans le modifier
+        m_volumes[ch] = std::clamp(volume, 0.0f, 1.0f);
+        m_mutes[ch] = mute;
+        m_volumeKnown[ch] = true;
+        node.remember(volume, mute);
+        log("canal " + std::to_string(ch + 1) + " : volume adopté de " + nodeDesc + " : " + percent(volume) +
+            (mute ? " (muet)" : ""));
+        applyToChannel(ch, &node);
+        if (m_onChannelChanged)
+            m_onChannelChanged(ch, m_volumes[ch], m_mutes[ch]);
+        return;
+    }
+
+    // Rapport initial d'un node qui n'a pas encore reçu le volume du canal : pas un changement
+    if (node.applied.empty())
+        return;
+
+    if (node.isEcho(volume, hasMute, muted))
+        return;
+
+    if (Clock::now() < node.graceUntil) {
+        log(nodeDesc + " : volume " + percent(volume) + " juste après son apparition, volume du canal réimposé");
+        applyToNode(node);
+        return;
+    }
+
+    m_volumes[ch] = std::clamp(volume, 0.0f, 1.0f);
+    m_mutes[ch] = mute;
+    // Les réglages antérieurs ne peuvent plus revenir en écho : le node en est déjà sorti
+    node.applied.clear();
+    node.remember(volume, mute);
+    log("canal " + std::to_string(ch + 1) + " : changement externe sur " + nodeDesc + " : " + percent(volume) +
+        (mute ? " (muet)" : ""));
+    applyToChannel(ch, &node);
+    if (m_onChannelChanged)
+        m_onChannelChanged(ch, m_volumes[ch], m_mutes[ch]);
+}
+
+void PipeWireMixer::onChannelAssigned(Node& node)
+{
+    // Volume du canal inconnu et état du node déjà rapporté (Props reçu avant l'assignation) :
+    // on l'adopte tout de suite plutôt que d'attendre un prochain rapport
+    if (node.channel >= 0 && !m_volumeKnown[node.channel] && node.hasReport)
+        handleReportedProps(node, node.reportVolume, node.reportHasMute, node.reportMuted);
+    else
+        applyToNode(node);
 }
 
 void PipeWireMixer::applyToNode(Node& node)
@@ -245,6 +377,10 @@ void PipeWireMixer::applyToNode(Node& node)
     auto* pod = static_cast<spa_pod*>(spa_pod_builder_pop(&b, &f));
 
     pw_node_set_param(node.proxy, SPA_PARAM_Props, 0, pod);
+
+    if (node.applied.empty())
+        node.graceUntil = Clock::now() + kGracePeriod;
+    node.remember(v, m_mutes[ch]);
 }
 
 void PipeWireMixer::updateNodeProps(Node& node, const spa_dict* props)
@@ -343,6 +479,7 @@ void PipeWireMixer::onRegistryGlobalRemove(void* data, uint32_t id)
         spa_hook_remove(&it->second->listener);
         pw_proxy_destroy(reinterpret_cast<pw_proxy*>(it->second->proxy));
         self->m_nodes.erase(it);
+        self->updateActiveCounts();
         return;
     }
 
@@ -370,7 +507,8 @@ void PipeWireMixer::onNodeInfo(void* data, const pw_node_info* info)
         self->log("node " + std::to_string(node->id) + " [" + node->mediaClass + "] " + node->nodeName +
                   " app='" + node->appName + "' bin='" + node->binary + "' -> canal " +
                   (ch < 0 ? std::string("aucun") : std::to_string(ch + 1)));
-        self->applyToNode(*node);
+        self->onChannelAssigned(*node);
+        self->updateActiveCounts();
     }
 }
 
@@ -381,19 +519,32 @@ void PipeWireMixer::onNodeParam(void* data, int /*seq*/, uint32_t id, uint32_t /
     if (id != SPA_PARAM_Props || !param || !spa_pod_is_object(param))
         return;
 
+    float volumes[SPA_AUDIO_MAX_CHANNELS];
+    uint32_t nVolumes = 0;
+    bool hasMute = false;
+    bool muted = false;
+
     const auto* obj = reinterpret_cast<const spa_pod_object*>(param);
     const spa_pod_prop* prop;
     SPA_POD_OBJECT_FOREACH(obj, prop)
     {
-        if (prop->key != SPA_PROP_channelVolumes || !spa_pod_is_array(&prop->value))
-            continue;
-        if (SPA_POD_ARRAY_VALUE_TYPE(&prop->value) != SPA_TYPE_Float)
-            continue;
+        if (prop->key == SPA_PROP_channelVolumes && spa_pod_is_array(&prop->value) &&
+            SPA_POD_ARRAY_VALUE_TYPE(&prop->value) == SPA_TYPE_Float) {
+            nVolumes = spa_pod_copy_array(&prop->value, SPA_TYPE_Float, volumes, SPA_AUDIO_MAX_CHANNELS);
+        } else if (prop->key == SPA_PROP_mute) {
+            hasMute = spa_pod_get_bool(&prop->value, &muted) == 0;
+        }
+    }
 
-        uint32_t n = 0;
-        spa_pod_get_array(&prop->value, &n);
-        if (n > 0)
-            node->channels = n;
+    if (nVolumes > 0) {
+        node->channels = nVolumes;
+        // Volumes linéaires -> échelle perceptuelle (cubique), comme pavucontrol : on prend le max
+        const float linear = std::max(0.0f, *std::max_element(volumes, volumes + nVolumes));
+        node->hasReport = true;
+        node->reportVolume = std::cbrt(linear);
+        node->reportHasMute = hasMute;
+        node->reportMuted = muted;
+        node->mixer->handleReportedProps(*node, node->reportVolume, hasMute, muted);
     }
 
     if (node->pendingApply && node->channels > 0)

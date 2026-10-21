@@ -1,7 +1,10 @@
 #include "serial_device.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -9,6 +12,11 @@
 namespace {
 
 constexpr size_t kMaxLineLength = 1024;
+// Au-delà, l'appareil ne lit manifestement plus : on abandonne ce qui n'a pas été écrit
+constexpr size_t kMaxOutBuffer = 64 * 1024;
+
+constexpr const char* kByIdDir = "/dev/serial/by-id/";
+constexpr const char* kDefaultPort = "/dev/ttyACM0";
 
 speed_t toSpeed(int baudrate)
 {
@@ -70,6 +78,7 @@ bool SerialDevice::open(const std::string& path, int baudrate, std::string& erro
 
     tcflush(m_fd, TCIFLUSH);
     m_buffer.clear();
+    m_outBuffer.clear();
     return true;
 }
 
@@ -80,6 +89,7 @@ void SerialDevice::close()
         m_fd = -1;
     }
     m_buffer.clear();
+    m_outBuffer.clear();
 }
 
 std::vector<std::string> SerialDevice::readLines(bool& disconnected)
@@ -116,4 +126,50 @@ std::vector<std::string> SerialDevice::readLines(bool& disconnected)
         m_buffer.clear();
 
     return lines;
+}
+
+bool SerialDevice::writeLine(const std::string& line)
+{
+    if (m_fd < 0)
+        return false;
+    if (m_outBuffer.size() + line.size() + 1 > kMaxOutBuffer)
+        m_outBuffer.clear();
+    m_outBuffer += line;
+    m_outBuffer += '\n';
+    return flush();
+}
+
+bool SerialDevice::flush()
+{
+    while (m_fd >= 0 && !m_outBuffer.empty()) {
+        const ssize_t n = ::write(m_fd, m_outBuffer.data(), m_outBuffer.size());
+        if (n > 0) {
+            m_outBuffer.erase(0, static_cast<size_t>(n));
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return true;  // le reste attendra que le fd soit inscriptible
+        return false;
+    }
+    return m_fd >= 0;
+}
+
+std::string SerialDevice::autoDetect()
+{
+    std::string found;
+    if (DIR* dir = opendir(kByIdDir)) {
+        while (const dirent* entry = readdir(dir)) {
+            std::string name = entry->d_name;
+            std::string lower = name;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            // Ordre stable si plusieurs appareils : le premier par ordre alphabétique
+            if (lower.find("miwer") != std::string::npos && (found.empty() || name < found))
+                found = name;
+        }
+        closedir(dir);
+    }
+    return found.empty() ? kDefaultPort : kByIdDir + found;
 }

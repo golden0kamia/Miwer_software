@@ -35,7 +35,32 @@ bool parseBool(const std::string& value, int lineNo)
     throw std::runtime_error("ligne " + std::to_string(lineNo) + " : booléen invalide '" + value + "'");
 }
 
+// Reconnaît « prefixN » avec N dans 1..kNumChannels ; retourne l'index du canal ou -1
+int channelKey(const std::string& key, const std::string& prefix)
+{
+    if (key.size() != prefix.size() + 1 || key.compare(0, prefix.size(), prefix) != 0)
+        return -1;
+    const char c = key.back();
+    return (c >= '1' && c < '1' + kNumChannels) ? c - '1' : -1;
+}
+
 }  // namespace
+
+std::string defaultLabel(const std::vector<std::string>& targets, int channel)
+{
+    if (targets.empty())
+        return "Canal " + std::to_string(channel + 1);
+    const std::string& t = targets.front();
+    if (t == kTargetMaster)
+        return "Master";
+    if (t == kTargetMic)
+        return "Micro";
+    if (t == kTargetOthers)
+        return "Autres";
+    std::string label = t;
+    label[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(label[0])));
+    return label;
+}
 
 std::string defaultConfigPath()
 {
@@ -73,7 +98,7 @@ Config loadConfig(const std::string& path)
 
         try {
             if (key == "device") {
-                cfg.device = value;
+                cfg.device = toLower(value) == "auto" ? "auto" : value;
             } else if (key == "baudrate") {
                 cfg.baudrate = std::stoi(value);
             } else if (key == "adc_max") {
@@ -82,6 +107,8 @@ Config loadConfig(const std::string& path)
                 cfg.noiseThreshold = std::clamp(std::stod(value), 0.0, 1.0);
             } else if (key == "invert_sliders") {
                 cfg.invertSliders = parseBool(value, lineNo);
+            } else if (key == "follow_external") {
+                cfg.followExternal = parseBool(value, lineNo);
             } else if (key == "verbose") {
                 cfg.verbose = parseBool(value, lineNo);
             } else if (key == "mute_mode") {
@@ -93,9 +120,10 @@ Config loadConfig(const std::string& path)
                 else
                     throw std::runtime_error("ligne " + std::to_string(lineNo) +
                                              " : mute_mode doit valoir 'toggle' ou 'state'");
-            } else if (key.rfind("channel", 0) == 0 && key.size() == 8 &&
-                       key[7] >= '1' && key[7] < '1' + kNumChannels) {
-                auto& targets = cfg.targets[key[7] - '1'];
+            } else if (const int ch = channelKey(key, "label"); ch >= 0) {
+                cfg.labels[ch] = value;
+            } else if (const int ch = channelKey(key, "channel"); ch >= 0) {
+                auto& targets = cfg.targets[ch];
                 targets.clear();
                 std::stringstream ss(value);
                 std::string item;
@@ -113,6 +141,10 @@ Config loadConfig(const std::string& path)
             throw std::runtime_error("ligne " + std::to_string(lineNo) + " : valeur hors limites '" + value + "'");
         }
     }
+
+    for (int ch = 0; ch < kNumChannels; ++ch)
+        if (cfg.labels[ch].empty())
+            cfg.labels[ch] = defaultLabel(cfg.targets[ch], ch);
 
     return cfg;
 }
